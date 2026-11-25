@@ -320,6 +320,44 @@ def test_byte_decoder_unicode_special_tokens_and_final_flush(monkeypatch):
         assert "".join(deltas) == tokenizer.decode(ids)
 
 
+def test_sentencepiece_byte_fallback_pieces_decode_to_text():
+    # Nanbeige ships a SentencePiece-style vocabulary: U+2581 spells a space and
+    # characters missing from the vocabulary arrive as <0xNN> byte pieces.
+    tokenizers = pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    pieces = ["<unk>", "<eos>"] + [f"<0x{b:02X}>" for b in range(256)]
+    pieces += ["\u2581", "a", "\u2581\u2581", "\u2581a", "b", "\u00b0", "C"]
+    vocab = {piece: i for i, piece in enumerate(pieces)}
+    backend = tokenizers.Tokenizer(
+        tokenizers.models.BPE(
+            vocab=vocab,
+            merges=[("\u2581", "a"), ("\u2581", "\u2581")],
+            unk_token="<unk>",
+            byte_fallback=True,
+        )
+    )
+    backend.pre_tokenizer = tokenizers.pre_tokenizers.Metaspace()
+    backend.decoder = tokenizers.decoders.Sequence(
+        [
+            tokenizers.decoders.Replace("\u2581", " "),
+            tokenizers.decoders.ByteFallback(),
+            tokenizers.decoders.Fuse(),
+            tokenizers.decoders.Strip(" ", 1, 0),
+        ]
+    )
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>", eos_token="<eos>"
+    )
+    assert tokenizer.convert_ids_to_tokens(tokenizer.encode("a\nb")) == ["\u2581a", "<0x0A>", "b"]
+    for text in ["a\nb", "a  b\tC", "a 100\u00b0C", "a \u4f60\u597d\U0001f642"]:
+        ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+        decoder = IncrementalText(tokenizer)
+        deltas = [decoder.decode(token, i == len(ids) - 1) for i, token in enumerate(ids)]
+        # A completion continues its prompt, so the leading space is kept.
+        assert "".join(deltas) == " " + tokenizer.decode(ids, skip_special_tokens=True)
+        assert "".join(deltas) == " " + text
+
+
 def test_incremental_text_uses_added_special_token_metadata():
     tokenizer = SimpleNamespace(
         all_special_ids=[0],

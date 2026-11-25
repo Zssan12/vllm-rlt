@@ -3,10 +3,14 @@
 import codecs
 import json
 import math
+import re
 from dataclasses import dataclass, fields, replace
 
 from vllm_rlt.models import special_token_ids
 from vllm_rlt.sampling_params import SamplingParams
+
+# SentencePiece byte-fallback piece, e.g. <0x0A> for a newline.
+_BYTE_PIECE = re.compile(r"<0x[0-9A-Fa-f]{2}>")
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,11 @@ class IncrementalText:
         for offset, byte in enumerate(b for b in range(256) if b not in visible):
             self.byte_decoder[chr(256 + offset)] = byte
         self.utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # SentencePiece-style vocabularies (e.g. Nanbeige) spell spaces as
+        # U+2581 and bytes missing from the vocabulary as <0xNN> pieces. Their
+        # pieces are plain UTF-8, so the ByteLevel alphabet must not apply.
+        decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
+        self.byte_level = decoder is None or type(decoder).__name__ == "ByteLevel"
 
     def decode(self, token_id, finished):
         data = b""
@@ -179,14 +188,21 @@ class IncrementalText:
             token = self.tokenizer.convert_ids_to_tokens(token_id)
             if token is None:
                 raise ValueError(f"tokenizer has no token for sampled ID {token_id}")
-            try:
-                data = bytes(self.byte_decoder[char] for char in token)
-            except KeyError:
-                # Handle SentencePiece leading space (\u2581) if present
-                if token.startswith("\u2581"):
-                    token = " " + token[1:]
-                data = token.encode("utf-8")
+            if self.byte_level:
+                try:
+                    data = bytes(self.byte_decoder[char] for char in token)
+                except KeyError:
+                    # Match ByteLevel's whole-token UTF-8 fallback for added tokens.
+                    data = token.encode("utf-8")
+            else:
+                data = self._piece_bytes(token)
         return self.utf8.decode(data, final=finished)
+
+    @staticmethod
+    def _piece_bytes(token):
+        if _BYTE_PIECE.fullmatch(token):
+            return bytes([int(token[3:5], 16)])
+        return token.replace("\u2581", " ").encode("utf-8")
 
 
 def usage(prompt_tokens, completion_tokens):
