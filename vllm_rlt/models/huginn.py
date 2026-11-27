@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm_rlt.layers import RMSNorm
+from vllm_rlt.layers import RMSNorm, apply_interleaved_rotary_pos_emb
 
 if TYPE_CHECKING:
     from vllm_rlt.core.kv_cache_manager import KVCacheManager
@@ -162,11 +162,7 @@ class HuginnAttention(nn.Module):
         k = k.view(shape) + self.qk_bias[1]
         v = v.view(shape)
         # Huginn rotates adjacent pairs, unlike split-half RoPE architectures.
-        pair = torch.stack((q, k), dim=0).float().reshape(2, count, self.n_heads, -1, 2)
-        cos, sin = freqs[..., 0].unsqueeze(0), freqs[..., 1].unsqueeze(0)
-        real = pair[..., 0] * cos - pair[..., 1] * sin
-        imag = pair[..., 1] * cos + pair[..., 0] * sin
-        q, k = torch.stack((real, imag), dim=-1).flatten(-2).to(hidden.dtype).unbind(0)
+        q, k = apply_interleaved_rotary_pos_emb(q, k, freqs)
         cache._write_prepared(self.layer_idx, batch, k, v)
         attended = cache._attend_prepared(self.layer_idx, batch, q)
         return self.proj(attended.reshape(count, -1))

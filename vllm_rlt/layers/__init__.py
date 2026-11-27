@@ -4,6 +4,7 @@
 from vllm_rlt.layers.normalization import RMSNorm
 from vllm_rlt.layers.rotary_embedding import (
     RotaryEmbedding,
+    apply_interleaved_rotary_pos_emb,
     apply_rotary_pos_emb,
     rotate_half,
 )
@@ -11,6 +12,7 @@ from vllm_rlt.layers.rotary_embedding import (
 __all__ = [
     "RMSNorm",
     "RotaryEmbedding",
+    "apply_interleaved_rotary_pos_emb",
     "apply_rotary_pos_emb",
     "rotate_half",
 ]

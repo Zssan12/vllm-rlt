@@ -95,6 +95,23 @@ are disabled, consistent with Ouro's inference-only model. `torch.compile` has
 no fake kernel registration. Tests cover the operator and Ouro MLP, including
 CUDA Graph capture/replay.
 
+## Rotary embedding
+
+`apply_rotary_pos_emb` (split-half: Ouro, Nanbeige, Dory) and
+`apply_interleaved_rotary_pos_emb` (adjacent pairs: Huginn) live in
+`vllm_rlt/layers/rotary_embedding.py`. On CUDA, `[tokens, heads, dim]` queries and
+keys with per-token factors are rotated by one Triton launch in
+`vllm_rlt/kernels/rotary.py`; other devices, broadcast factor shapes and
+gradient-enabled inputs keep the Torch expression.
+
+The kernel reads the existing BF16/FP16 cos/sin factors, computes the rotation in
+FP32 and rounds each output once. For the split-half models this differs from the
+Torch expression, which rounds the two products and their sum separately; the
+fused result is closer to an FP64 reference. Huginn's Torch path already computes
+in FP32, so the two paths agree to within one unit in the last place. Tests in
+`tests/test_rotary_embedding.py` cover FP64 bounds, strided projection views,
+the fallback path and CUDA Graph replay.
+
 ## Build and reference checks
 
 The extension builds automatically when the build environment has CUDA-enabled
