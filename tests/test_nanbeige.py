@@ -9,9 +9,12 @@ from safetensors.torch import save_file
 
 from tests.helpers import make_cpu_cache, tiny_nanbeige_config
 from tests.reference import dense_nanbeige_reference
+from vllm_rlt import CacheConfig, ExecutionConfig, SchedulerConfig
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.models import AutoModelForCausalLM, NanbeigeConfig, NanbeigeForCausalLM
+from vllm_rlt.kernels import silu_and_mul
+from vllm_rlt.models import AutoModelForCausalLM, NanbeigeConfig, NanbeigeForCausalLM, nanbeige
+from vllm_rlt.models.nanbeige import NanbeigeMLP
 from vllm_rlt.sampling_params import SamplingParams
 
 
@@ -401,3 +404,123 @@ def test_parity_against_real_checkpoint_hf_transformers():
     assert hf_greedy_tokens == vllm_greedy_tokens, (
         f"Greedy tokens mismatch: HF {hf_greedy_tokens} vs vLLM {vllm_greedy_tokens}"
     )
+
+
+def test_mlp_uses_silu_and_mul_and_matches_unfused_expression(model, monkeypatch):
+    layer = model.model.layers[0].mlp
+    hidden = torch.randn(5, model.config.hidden_size)
+    expected = layer.down_proj(
+        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
+    )
+    calls = []
+
+    def record(gate, up):
+        calls.append(gate.shape)
+        return silu_and_mul(gate, up)
+
+    monkeypatch.setattr(nanbeige, "silu_and_mul", record)
+    torch.testing.assert_close(layer(hidden), expected, rtol=0, atol=0)
+    assert calls == [(5, model.config.intermediate_size)]
+
+
+def test_fixed_loop_count_runs_every_loop_and_rejects_shallow_bounds(model):
+    assert model.fixed_loop_count is True
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    engine = LLMEngine(model, attention_backend="torch")
+    with pytest.raises(ValueError, match="max_loops must match"):
+        engine.add_request(
+            "shallow", [1, 5, 8], SamplingParams(max_tokens=2, min_loops=1, max_loops=1)
+        )
+    engine.add_request(
+        "full", [1, 5, 8], SamplingParams(max_tokens=3, temperature=0.0, ignore_eos=True)
+    )
+    final = None
+    while engine.has_unfinished_requests():
+        for output in engine.step():
+            final = output
+    assert final.exit_depths == [2, 2, 2]
+
+
+@pytest.mark.parametrize("max_num_seqs", [1, 3])
+def test_async_scheduling_matches_synchronous_greedy_tokens(model, max_num_seqs):
+    prompts = {"a": [1, 5, 8], "b": [9, 2, 6, 5], "c": [8, 3, 3, 11, 5, 2, 7]}
+
+    def generate(async_scheduling):
+        engine = LLMEngine(
+            model,
+            attention_backend="torch",
+            cache_config=CacheConfig(num_blocks=128, block_size=2),
+            scheduler_config=SchedulerConfig(max_num_seqs=max_num_seqs, max_num_batched_tokens=16),
+            execution_config=ExecutionConfig(async_scheduling=async_scheduling),
+        )
+        params = SamplingParams(max_tokens=6, temperature=0.0, ignore_eos=True)
+        for request_id, prompt in prompts.items():
+            engine.add_request(request_id, prompt, params)
+        finished = {}
+        try:
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        finished[output.request_id] = output
+            assert engine.cache_manager.num_used_blocks == 0
+        finally:
+            engine.close()
+        return {key: (value.token_ids, value.exit_depths) for key, value in finished.items()}
+
+    expected = generate(False)
+    assert set(expected) == set(prompts)
+    assert generate(True) == expected
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("rows", [1, 7, 32])
+def test_cuda_mlp_matches_torch_expression(dtype, rows):
+    torch.manual_seed(72)
+    layer = NanbeigeMLP(tiny_nanbeige_config(intermediate_size=17)).to(device="cuda", dtype=dtype)
+    layer.requires_grad_(False)
+    hidden = torch.randn(rows, layer.gate_proj.in_features, device="cuda", dtype=dtype)
+    expected = layer.down_proj(
+        torch.nn.functional.silu(layer.gate_proj(hidden)) * layer.up_proj(hidden)
+    )
+    torch.testing.assert_close(layer(hidden), expected, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "execution",
+    [
+        dict(cuda_graphs=True),
+        dict(async_scheduling=True),
+        dict(async_scheduling=True, cuda_graphs=True),
+    ],
+)
+def test_cuda_execution_modes_match_synchronous_eager(execution):
+    torch.manual_seed(42)
+    model = NanbeigeForCausalLM(tiny_nanbeige_config()).cuda().bfloat16().eval()
+    prompts = {"a": [1, 5, 8], "b": [9, 2, 6, 5], "c": [8, 3, 3, 11, 5, 2, 7]}
+
+    def generate(**options):
+        engine = LLMEngine(
+            model,
+            attention_backend="triton",
+            cache_config=CacheConfig(num_blocks=256, block_size=16),
+            scheduler_config=SchedulerConfig(max_num_seqs=3, max_num_batched_tokens=32),
+            execution_config=ExecutionConfig(**options),
+        )
+        params = SamplingParams(max_tokens=8, temperature=0.0, ignore_eos=True)
+        for request_id, prompt in prompts.items():
+            engine.add_request(request_id, prompt, params)
+        finished = {}
+        try:
+            while engine.has_unfinished_requests():
+                for output in engine.step():
+                    if output.finished:
+                        finished[output.request_id] = output.token_ids
+        finally:
+            engine.close()
+        return finished
+
+    expected = generate()
+    assert set(expected) == set(prompts)
+    assert generate(**execution) == expected

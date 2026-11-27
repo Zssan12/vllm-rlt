@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
+from vllm_rlt.kernels import silu_and_mul
 from vllm_rlt.layers import (
     RMSNorm,
     RotaryEmbedding,
@@ -176,7 +176,7 @@ class NanbeigeMLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return self.down_proj(silu_and_mul(self.gate_proj(hidden), self.up_proj(hidden)))
 
 
 class NanbeigeDecoderLayer(nn.Module):
@@ -219,11 +219,17 @@ class NanbeigeModel(nn.Module):
 class NanbeigeForCausalLM(nn.Module):
     """Nanbeige causal language model matching the vllm-rlt execution contract."""
 
+    # Every request runs all total_ut_steps loops; there is no exit decision, so
+    # asynchronous scheduling can submit the next loop without a gate readback.
+    fixed_loop_count = True
+
     def __init__(self, config: NanbeigeConfig) -> None:
         super().__init__()
         self.config = config
         self.model = NanbeigeModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Inference-only, as the native silu_and_mul rejects gradient-enabled inputs.
+        self.requires_grad_(False)
 
     def prelude(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(tokens)

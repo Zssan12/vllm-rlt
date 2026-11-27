@@ -83,16 +83,16 @@ enough work to fill the larger grid. Aligned inputs retain their existing launch
 geometry. Grid sizes, 16/32-byte transfers and scalar/packed FP32 products were compared on B300;
 the selected configuration is not a universal hardware optimum.
 
-Ouro's inference MLP calls this registered operator directly. Availability is
+Ouro and Nanbeige inference MLPs call this registered operator directly. Availability is
 resolved once during module initialization; extension ABI or dependency errors
 propagate rather than silently selecting another path. The native CUDA dispatch
 reuses its C++ input checks; a missing extension does not mask native execution
 errors when an installed kernel is selected.
-Nanbeige and Huginn do not use this operator yet.
+Huginn does not use this operator yet.
 
 Autograd is unsupported: gradient-enabled inputs are rejected unless gradients
-are disabled, consistent with Ouro's inference-only model. `torch.compile` has
-no fake kernel registration. Tests cover the operator and Ouro MLP, including
+are disabled, consistent with the inference-only Ouro and Nanbeige models. `torch.compile` has
+no fake kernel registration. Tests cover the operator and the Ouro and Nanbeige MLPs, including
 CUDA Graph capture/replay.
 
 ## Build and reference checks
