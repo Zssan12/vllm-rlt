@@ -550,9 +550,18 @@ class StageEngine:
             raise ValueError("request_id must be a nonempty string")
         params = sampling_params or SamplingParams()
         if (
-            self.speculative_config and self.speculative_config.mode == "pipeline"
-        ) and params.temperature != 0:
-            raise ValueError("pipeline speculative decoding currently requires greedy sampling")
+            self.pipeline_speculative
+            and params.temperature != 0
+            and (
+                getattr(self.model, "requires_ordered_pipeline_coda", False)
+                or self.speculative_config.pipeline_graph != "off"
+                or self.scheduler.config.enable_preemption
+            )
+        ):
+            raise ValueError(
+                "ordered pipeline CODA, pipeline_graph and preemption currently require "
+                "greedy sampling in pipeline speculation"
+            )
         if request_id in self._retiring_speculative:
             self._retire_speculative(wait=True, request_id=request_id)
         config = self.model.config

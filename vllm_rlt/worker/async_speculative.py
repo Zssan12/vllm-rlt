@@ -1,10 +1,11 @@
 """Bounded cross-round speculation with device-owned token positions.
 
-Block mode supports greedy and random (temperature/top-k/top-p) requests in one batch. Greedy
-requests verify by target argmax. Random requests draw drafts from their ``q`` distributions,
-verify with speculative rejection sampling against ``p`` (see ``speculative_sampling``) and
-return their committed sequence (accepted drafts, then correction or bonus) in the result rows.
-A batch without random requests takes the greedy path with no extra device work.
+Block and pipeline modes support greedy and random (temperature/top-k/top-p) requests in one
+batch. Greedy requests verify by target argmax. Random requests draw drafts from their ``q``
+distributions and verify with speculative rejection sampling against ``p`` (see
+``speculative_sampling``). Block mode returns their committed sequence (accepted drafts, then
+correction or bonus) in the result rows. A batch without random requests takes the greedy path
+with no extra device work.
 """
 
 import math
@@ -218,6 +219,7 @@ class DevicePipelineState:
     hidden: torch.Tensor
     candidates: torch.Tensor
     active: torch.Tensor
+    proposals: torch.Tensor | None = None  # [width, V] draft distributions, random only
 
 
 @dataclass
@@ -245,9 +247,10 @@ class SpeculativeRoundBuffer:
         self.tables_dirty = False
         self.tables = torch.empty(math.prod(shape), dtype=torch.int32, device=cache.device)
         self.plan_key = None
+        self.random_plan = None
         self.plan = None
         if pipeline_capacity:
-            size = ((3 + 2 * pipeline_capacity) * scheduler.max_num_seqs,)
+            size = ((7 + 2 * pipeline_capacity) * scheduler.max_num_seqs,)
             self.host_plan = pinned_tensor(size, torch.int64, cache.device)
             self.device_plan = torch.empty(size, dtype=torch.int64, device=cache.device)
         self.inputs_ready = None
@@ -495,6 +498,9 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                 ),
                 torch.zeros(width, dtype=torch.long, device=self.device),
                 torch.arange(width, device=self.device) == 0,
+                torch.zeros((width, self.model.config.vocab_size), device=self.device)
+                if request.sampling_params.temperature != 0
+                else None,
             )
         self.states[rid] = state
         return state
@@ -610,7 +616,12 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             len(span.request.prompt_token_ids) + span.request.sampling_params.max_tokens - 1
             for span in spans
         )
-        key = (widths, limits)
+        random = tuple(
+            (i, span.request.sampling_params)
+            for i, span in enumerate(spans)
+            if span.request.sampling_params.temperature != 0
+        )
+        key = (widths, limits, tuple((i, p.temperature, p.top_k, p.top_p) for i, p in random))
         if key == buffer.plan_key:
             return False
         roots, rows, owners = [], [], []
@@ -618,11 +629,30 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             roots.append(len(rows))
             rows.extend(range(index * capacity, index * capacity + width))
             owners.extend([index] * width)
-        n, num_rows = len(widths), len(rows)
-        size = 3 * n + 2 * num_rows
-        host = buffer.host_plan[:size]
-        host.numpy()[:] = (*widths, *limits, *roots, *rows, *owners)
-        buffer.plan = buffer.device_plan[:size].split((n, n, n, num_rows, num_rows))
+        n, num_rows, r = len(widths), len(rows), len(random)
+        size = 3 * n + 2 * num_rows + 4 * r
+        host = buffer.host_plan[:size].numpy()
+        host[: size - 4 * r] = (*widths, *limits, *roots, *rows, *owners)
+        plan = buffer.device_plan[:size].split((n, n, n, num_rows, num_rows, r, r, r, r))
+        buffer.plan, buffer.random_plan = plan[:5], None
+        if random:
+            # Random requests: [item index | temperature bits | top_k | top_p bits].
+            temperature = np.array([p.temperature for _, p in random], dtype=np.float64)
+            top_k = np.array([p.top_k for _, p in random], dtype=np.int64)
+            top_p = np.array([p.top_p for _, p in random], dtype=np.float64)
+            host[size - 4 * r :] = np.concatenate(
+                ([i for i, _ in random], temperature.view(np.int64), top_k, top_p.view(np.int64))
+            )
+            truncating = top_k[(top_k > 0) & (top_k < self.model.config.vocab_size)]
+            buffer.random_plan = SimpleNamespace(
+                items=[i for i, _ in random],
+                requests=plan[5],
+                temperature=plan[6].view(torch.float64),
+                top_k=plan[7],
+                top_p=plan[8].view(torch.float64),
+                max_top_k=int(truncating.max()) if len(truncating) else 0,
+                apply_top_p=bool((top_p < 1).any()),
+            )
         buffer.plan_key = key
         return True
 
@@ -904,6 +934,8 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
                     copy_tensor(host_tables, tables, use_uva=self.use_uva)
                 if plan_dirty:
                     size = sum(t.numel() for t in buffer.plan)
+                    if buffer.random_plan is not None:
+                        size += 4 * len(buffer.random_plan.items)
                     copy_tensor(
                         buffer.host_plan[:size], buffer.device_plan[:size], use_uva=self.use_uva
                     )
@@ -971,7 +1003,13 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
 
     def _pipeline_step(self, spans, states, tables, allocations, buffer, *, prompt=None):
         graph = self.round_graph
-        if graph is not None and prompt is None and graph.supports(buffer.plan_key[0], tables):
+        random = buffer.random_plan
+        if (
+            random is None
+            and graph is not None
+            and prompt is None
+            and graph.supports(buffer.plan_key[0], tables)
+        ):
             graph.forward(states, tables, buffer)
             for state in states:
                 state.submitted += 1
@@ -1041,9 +1079,47 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             choices[roots] = target
             choices[tails] = torch.where(draft_rows, draft, choices[tails])
         else:
-            choices = self._coda(hidden).argmax(-1)
+            logits = self._coda(hidden)
+            choices = logits.argmax(-1)
         predictions = torch.zeros_like(pipeline.tokens)
         predictions.flatten().index_copy_(0, rows, choices)
+        if random is not None:
+            # Random requests sample their tail draft from q and verify their root draft against
+            # p. A rejected draft has no residual mass, so the transition's candidate/prediction
+            # comparison still decides acceptance. Each takes 3 uniforms per step, no host sync.
+            items, r = random.requests, torch.arange(len(random.items), device=self.device)
+            tails = (lengths[items] - 1).clamp_min(0)
+            temperature, top_k, top_p = random.temperature.float(), random.top_k, random.top_p
+            q, p = batched_probabilities(
+                logits[torch.cat((roots[items] + tails, roots[items]))],
+                temperature.repeat(2),
+                top_k.repeat(2),
+                top_p.float().repeat(2),
+                max_top_k=random.max_top_k,
+                apply_top_p=random.apply_top_p,
+            ).chunk(2)
+            generators = [
+                self.rng.acquire(req.request_id, req.sampling_params, self.device)
+                for req in (spans[i].request for i in random.items)
+            ]
+            u = torch.stack([torch.rand(3, generator=g, device=self.device) for g in generators])
+            draft, _ = categorical(q, u[:, 0])
+            proposals = torch.stack([states[i].pipeline.proposals for i in random.items])
+            verdict = speculative_accept(
+                pipeline.candidates[items, :1],
+                torch.ones_like(items),
+                proposals[:, :1],
+                p[:, None].expand(-1, 2, -1),
+                u[:, 1:2],
+                u[:, 2],
+            )
+            new_depths = pipeline.depths[items] + valid[items].long() * self.config.draft_loops
+            drafted = valid[items][r, tails] & (new_depths[r, tails] == self.config.draft_loops)
+            emitted = valid[items, 0] & (new_depths[:, 0] == self.config.target_loops)
+            predictions[items, tails] = torch.where(drafted, draft, predictions[items, tails])
+            verified = verdict.tokens[:, 0]
+            predictions[items, 0] = torch.where(emitted, verified, predictions[items, 0])
+            proposals[r, tails] = torch.where(drafted[:, None], q, proposals[r, tails])
         pipeline.hidden.flatten(0, 1).index_copy_(0, rows, hidden)
         input_tokens = torch.stack([state.token for state in states])
         transition = self.transition_graph
@@ -1071,6 +1147,11 @@ class AsyncSpeculativeRunner(SpeculativeRunner):
             1, update.source[:, :, None].expand(-1, -1, pipeline.hidden.shape[2])
         )
         publish_pipeline(states, shifted_hidden, update, buffer)
+        if random is not None:
+            torch._foreach_copy_(
+                [states[i].pipeline.proposals for i in random.items],
+                proposals.gather(1, update.source[items, :, None].expand_as(proposals)).unbind(),
+            )
         for state in states:
             state.submitted += 1
         return num_rows

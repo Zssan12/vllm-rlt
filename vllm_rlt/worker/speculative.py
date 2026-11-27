@@ -120,6 +120,7 @@ class PipelineToken:
     depth: int = 0
     hidden: torch.Tensor | None = None
     candidate: int | None = None
+    proposal: torch.Tensor | None = None  # draft distribution of a random request
 
 
 @dataclass
@@ -181,6 +182,7 @@ class PipelineStep:
     tokens: list[PipelineToken]
     endpoints: list[int]
     decisions: torch.Tensor
+    logits: torch.Tensor | None = None  # kept only when the batch has random requests
 
 
 class SpeculativeRunner:
@@ -402,8 +404,6 @@ class SpeculativeRunner:
         states, tokens, ids = [], [], []
         for span in batch.requests:
             request = span.request
-            if request.sampling_params.temperature != 0:
-                raise ValueError("pipeline speculation requires greedy sampling")
             state = self.pipeline_states.get(request.request_id)
             if state is None or state.request is not request or state.position != request.position:
                 state = PipelineState(
@@ -475,14 +475,17 @@ class SpeculativeRunner:
             token.depth += self.config.draft_loops
         # Synchronous execution reads decisions in collect(), before the next step.
         coda_layouts = views.get(Operation.CODA, ())
-        choices = [
-            self._coda(hidden[rows], layouts[coda_layouts[i]] if coda_layouts else None).argmax(-1)
+        logits = [
+            self._coda(hidden[rows], layouts[coda_layouts[i]] if coda_layouts else None)
             for i, rows in enumerate(coda_batches)
         ]
-        if len(choices) > 1:
-            decisions = torch.cat(choices)
+        if len(logits) > 1:
+            logits = torch.cat(logits)
         else:
-            decisions = choices[0] if choices else hidden.new_empty(0, dtype=torch.long)
+            logits = logits[0] if logits else hidden.new_empty((0, self.model.config.vocab_size))
+        decisions = logits.argmax(-1)
+        if all(state.request.sampling_params.temperature == 0 for state in states):
+            logits = None
         event = None
         if self.device.type == "cuda":
             event = torch.cuda.Event()
@@ -495,39 +498,52 @@ class SpeculativeRunner:
             [],
             [],
             event,
-            pipeline=PipelineStep(states, tokens, endpoints, decisions),
+            pipeline=PipelineStep(states, tokens, endpoints, decisions, logits),
         )
 
     def _collect_pipeline(self, submission):
         step = submission.pipeline
-        predictions = {
-            id(step.tokens[i]): value for i, value in zip(step.endpoints, step.decisions.tolist())
-        }
+        rows = {id(step.tokens[i]): row for row, i in enumerate(step.endpoints)}
+        decisions = step.decisions.tolist()
         results = []
         for span, state in zip(submission.batch.requests, step.states):
             if self.pipeline_states.get(span.request.request_id) is not state:
                 results.append(SpeculativeResult([], 0))
                 continue
             state.pending = False
+            request, params = state.request, state.request.sampling_params
             following, final = [], None
-            limit = (
-                len(state.request.prompt_token_ids) + state.request.sampling_params.max_tokens - 1
-            )
+            limit = len(request.prompt_token_ids) + params.max_tokens - 1
             for token in state.tokens:
                 if token.depth == self.config.target_loops:
                     final = token
                 else:
                     following.append(token)
                     if token.depth == self.config.draft_loops:
-                        token.candidate = predictions[id(token)]
+                        row = rows[id(token)]
+                        if params.temperature == 0:
+                            token.candidate = decisions[row]
+                        else:
+                            token.proposal = Sampler.probabilities(step.logits[row], params)
+                            generator = self._acquire_generator(request, step.logits)
+                            token.candidate = int(Sampler.draw(token.proposal, generator).item())
                         self.stats.drafted_tokens += 1
                         if token.position + 1 < min(limit, span.token_start + span.token_count):
                             following.append(PipelineToken(token.position + 1, token.candidate))
             emitted, accepted = [], 0
             if final is not None:
-                prediction = predictions[id(final)]
+                row = rows[id(final)]
+                if params.temperature == 0:
+                    prediction = decisions[row]
+                    accepted = int(final.candidate == prediction)
+                else:
+                    target = Sampler.probabilities(step.logits[row], params)
+                    generator = self._acquire_generator(request, step.logits)
+                    prediction, accepted = rejection_sample(
+                        final.candidate, target, final.proposal, generator
+                    )
+                    accepted = int(accepted)
                 emitted = [prediction]
-                accepted = int(final.candidate == prediction)
                 state.position += 1
                 self.stats.verified_rows += 1
                 if not accepted:

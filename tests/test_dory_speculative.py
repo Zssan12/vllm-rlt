@@ -446,9 +446,6 @@ def test_unqualified_speculative_combinations_fail_at_construction():
             cache_config=CacheConfig(num_blocks=256, block_size=2, layout="shared"),
             speculative_config=SpeculativeConfig(2, draft_loops=1, target_loops=2),
         )
-    pipeline = engine(model, 2, 1, "pipeline")
-    with pytest.raises(ValueError, match="greedy"):
-        pipeline.add_request("r", [4], params(model, 2, temperature=0.7))
     block = engine(model, 2, 1)
     with pytest.raises(ValueError, match="min_loops and max_loops"):
         block.add_request("r", [4], SamplingParams(max_tokens=2, min_loops=1, max_loops=2))
