@@ -120,15 +120,12 @@ def test_async_block_engine_accepts_random_sampling():
 
 
 @pytest.mark.gpu
-def test_async_pipeline_engine_still_rejects_random_sampling():
+def test_async_pipeline_engine_accepts_random_sampling():
+    params = random_params(max_tokens=4, temperature=0.8, top_k=8, top_p=0.9, seed=7)
     with make_llm("pipeline") as llm:
-        client = llm.engine
-        with pytest.raises(ValueError, match="greedy"):
-            client.add_request("r", PROMPT, random_params())
-        # Rejection leaves no client-side trace and does not take the worker down.
-        assert client.request_ids() == ()
-        assert not client.has_unfinished_requests()
-        assert client.process.is_alive()
+        final = stream(llm, [("r", PROMPT, params)])["r"][-1]
+        assert final.finished and final.finish_reason == "length"
+        assert_valid_tokens(final.token_ids, 4)
     assert_closed_cleanly(llm.engine)
 
 

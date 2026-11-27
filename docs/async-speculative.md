@@ -189,8 +189,8 @@ round completion events and deferred retirement retain their existing owners.
 
 Async block speculation accepts `temperature`, `top_k`, `top_p` and `seed` in
 `SamplingParams`, and greedy (`temperature=0`) and random requests can share one
-speculative batch. Pipeline mode and the PD decode stage still reject
-`temperature != 0` and require greedy sampling.
+speculative batch. Pipeline mode accepts them too, except with ordered pipeline CODA,
+`pipeline_graph` or preemption. The PD decode stage still requires greedy sampling.
 
 ```python
 SamplingParams(temperature=0.8, top_k=50, top_p=0.95, seed=1234,
@@ -225,6 +225,8 @@ positions; greedy-only rounds keep the previous layout and do no extra device wo
 - Each random request draws one `torch.rand(2K + 1)` per submitted round, with
   `K = num_speculative_tokens`: `[0:K]` for draft sampling, `[K:2K]` for acceptance
   and `[2K]` for the correction or bonus token.
+- Asynchronous pipeline mode draws one `torch.rand(3)` per step instead: tail draft,
+  root acceptance and correction.
 - Consumption does not depend on the round's draft count or acceptance outcomes,
   so no host synchronization is needed. It differs from synchronous speculation,
   which draws per token and stops at the first rejection.
@@ -250,7 +252,7 @@ span it had reserved.
 | --- | --- |
 | Async block, local stage, eager | Validated on one RTX 5090 (SM120) with the Triton backend |
 | Async block, local stage, CUDA Graphs | Validated on one RTX 5090 (SM120) with the Triton backend |
-| Pipeline mode (synchronous or asynchronous) | Greedy only |
+| Pipeline mode (synchronous or asynchronous) | Supported without ordered pipeline CODA, `pipeline_graph` or preemption |
 | PD decode stage with async speculation | Greedy only |
 | FA4 | Not yet validated |
 | Speculative preemption | Not applicable (preemption is rejected in async block mode) |
@@ -983,7 +985,7 @@ by `draft_loops`; different requests and depths share the recurrent call.
 The runner retains hidden states between submissions, while Scheduler owns
 admission, committed outputs, EOS and KV allocation. Rejection discards dependent
 tokens; the returned KV frontier preserves surviving speculative work.
-The pipeline requires greedy sampling and `last_exited` KV. It supports
+The pipeline requires `last_exited` KV; random sampling is described above. It supports
 `--async-scheduling`, `--cuda-graphs` and `--enable-preemption`, including their
 combination with compatible attention backends such as Triton and FA4.
 The asynchronous pipeline uses the same compute/copy streams and two leased result

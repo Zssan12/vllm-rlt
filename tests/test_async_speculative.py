@@ -17,7 +17,6 @@ from vllm_rlt import (
 )
 from vllm_rlt.core.scheduler import Scheduler
 from vllm_rlt.engine.llm_engine import LLMEngine
-from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.request import Request, RequestPhase
 
 tiny = tiny_ouro_model
@@ -224,22 +223,6 @@ def test_cancel_and_partial_submission_failure_reclaim_resources(monkeypatch, gr
     assert not e.scheduler.requests
     assert not e.speculative_runner.states
     assert e.cache_manager.num_used_blocks == 0
-
-
-@pytest.mark.gpu
-def test_async_pipeline_rejects_random_sampling():
-    e = StageEngine(
-        tiny_ouro_model("cuda"),
-        attention_backend="triton",
-        cache_config=CacheConfig(256, 2, enable_prefix_caching=False, incremental_allocation=True),
-        scheduler_config=SchedulerConfig(
-            max_num_seqs=4, max_num_batched_tokens=16, prefill_chunk_size=2
-        ),
-        execution_config=ExecutionConfig(async_scheduling=True, multi_stream=True),
-        speculative_config=SpeculativeConfig(3, mode="pipeline"),
-    )
-    with pytest.raises(ValueError, match="greedy"):
-        e.add_request("r", [2], SamplingParams(temperature=0.8))
 
 
 @pytest.mark.gpu
