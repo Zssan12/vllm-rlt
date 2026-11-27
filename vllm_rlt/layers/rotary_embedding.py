@@ -17,10 +17,60 @@ def apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Applies Rotary Position Embedding (RoPE) to Query and Key states."""
+    """Applies Rotary Position Embedding (RoPE) to Query and Key states.
+
+    CUDA `[tokens, heads, dim]` inputs with per-token `[tokens, 1, dim]` factors use
+    one fused Triton launch that rounds each output once; other inputs use Torch.
+    """
+    if (
+        _fusable(q, k, cos, sin)
+        and cos.shape == (q.shape[0], 1, q.shape[2])
+        and cos.dtype == sin.dtype == q.dtype
+    ):
+        from vllm_rlt.kernels.rotary import split_half_rope
+
+        return split_half_rope(q, k, cos, sin)
     q_embed = q * cos + rotate_half(q) * sin
     k_embed = k * cos + rotate_half(k) * sin
     return q_embed, k_embed
+
+
+def apply_interleaved_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, freqs: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate adjacent (even, odd) pairs by `freqs[..., 0]` (cos) and `freqs[..., 1]` (sin).
+
+    `q` and `k` are `[tokens, heads, dim]`; `freqs` is `[tokens, 1, dim / 2, 2]`.
+    The rotation is computed in FP32 and returned in the input dtype.
+    """
+    rows, heads, dim = q.shape
+    if (
+        _fusable(q, k, freqs, freqs)
+        and k.shape == q.shape
+        and freqs.shape == (rows, 1, dim // 2, 2)
+    ):
+        from vllm_rlt.kernels.rotary import interleaved_rope
+
+        return interleaved_rope(q, k, freqs)
+    pair = torch.stack((q, k), dim=0).float().reshape(2, rows, heads, -1, 2)
+    cos, sin = freqs[..., 0].unsqueeze(0), freqs[..., 1].unsqueeze(0)
+    real = pair[..., 0] * cos - pair[..., 1] * sin
+    imag = pair[..., 1] * cos + pair[..., 0] * sin
+    q, k = torch.stack((real, imag), dim=-1).flatten(-2).to(q.dtype).unbind(0)
+    return q, k
+
+
+def _fusable(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> bool:
+    return (
+        q.is_cuda
+        and q.ndim == k.ndim == 3
+        and q.shape[0] == k.shape[0]
+        and q.shape[2] == k.shape[2]
+        and q.dtype == k.dtype
+        and cos.shape == sin.shape
+        and cos.device == q.device
+        and not (q.requires_grad or k.requires_grad)
+    )
 
 
 class RotaryEmbedding(nn.Module):
